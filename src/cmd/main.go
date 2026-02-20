@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import(
 	"flag"
@@ -35,14 +35,22 @@ func main() {
 
 	flag.Parse()
 
-	logger.Info("Configuration loaded", slog.Any("config", cfg))
+	logger.Info("configuration loaded", slog.Any("config", cfg))
 
-	_, err := node.New(cfg)
+	n, err := node.New(cfg)
 	if err != nil {
 		logger.Error("failed to initialize node", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 
-	logger.Info("Node initialized")
+	if cfg.Bootstrap != "" {
+		logger.Info("starting as peer", slog.String("bootstrap", cfg.Bootstrap), slog.Int("port", cfg.Port))
+	} else {
+		logger.Info("starting as seed node", slog.Int("port", cfg.Port))
+	}
 
+	if err := n.Start(); err != nil {
+		logger.Error("node exited with error", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 }
