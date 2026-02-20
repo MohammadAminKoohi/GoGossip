@@ -80,16 +80,20 @@ func (s *Store) Count() int {
 	return len(s.peers)
 }
 
-func (s *Store) PruneStale() {
+// PruneStale removes peers not seen within the timeout and returns the list of removed peers.
+func (s *Store) PruneStale() []message.PeerInfo {
 	if s.timeout <= 0 {
-		return
+		return nil
 	}
 	deadline := time.Now().Add(-s.timeout)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var removed []message.PeerInfo
 	for id, p := range s.peers {
 		if p.LastSeenAt.Before(deadline) {
+			removed = append(removed, message.PeerInfo{NodeID: p.NodeID, Addr: p.Addr})
 			delete(s.peers, id)
 		}
 	}
+	return removed
 }

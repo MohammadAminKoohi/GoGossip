@@ -1,10 +1,12 @@
 package node
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/message"
@@ -29,8 +31,9 @@ type Node struct {
 	selfAddr string
 	uuid     uuid.UUID
 
-	peers *peer.Store
-	seen  *seen.Set
+	peers        *peer.Store
+	seen         *seen.Set
+	helloReplied *seen.Set // sender IDs we've already sent a HELLO reply to (avoid infinite loop)
 }
 
 func New(cfg Config) (*Node, error) {
@@ -40,24 +43,73 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:      cfg,
-		selfAddr: fmt.Sprintf("127.0.0.1:%d", cfg.Port),
-		uuid:     uuid.New(),
-		peers:    peer.NewStore(cfg.PeerLimit, cfg.PeerTimeout),
-		seen:     seen.NewSet(),
+		cfg:          cfg,
+		selfAddr:     fmt.Sprintf("127.0.0.1:%d", cfg.Port),
+		uuid:         uuid.New(),
+		peers:        peer.NewStore(cfg.PeerLimit, cfg.PeerTimeout),
+		seen:         seen.NewSet(),
+		helloReplied: seen.NewSet(),
 	}
 
 	slog.Info("node created", slog.String("uuid", n.uuid.String()), slog.String("addr", n.selfAddr))
 	return n, nil
 }
 
+// Start starts the node: listens for packets and runs the periodic ping loop in the background.
+// It returns immediately so the caller can run the CLI or other logic.
 func (n *Node) Start() error {
+	go func() {
+		if err := network.Listen(n.selfAddr, n.handlePacket); err != nil {
+			slog.Error("listener exited", slog.String("error", err.Error()))
+		}
+	}()
+	go n.runPingAndPruneLoop()
 	if n.cfg.Bootstrap != "" {
 		if err := n.sendHelloToBootstrap(); err != nil {
 			return err
 		}
+		if err := n.sendGetPeersToBootstrap(); err != nil {
+			return err
+		}
 	}
-	return network.Listen(n.selfAddr, n.handlePacket)
+	return nil
+}
+
+// runPingAndPruneLoop sends PING to all peers at PingInterval and prunes stale peers.
+func (n *Node) runPingAndPruneLoop() {
+	interval := time.Duration(n.cfg.PingInterval) * time.Millisecond
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		removed := n.peers.PruneStale()
+		for _, p := range removed {
+			slog.Info("peer removed, no pong received", slog.String("node_id", p.NodeID), slog.String("addr", p.Addr))
+		}
+		peers := n.peers.List()
+		pingID := uuid.New().String()
+		for i, p := range peers {
+			if p.NodeID == n.uuid.String() {
+				continue
+			}
+			payload := message.PingPayload{PingID: pingID, Seq: int64(i)}
+			env, err := message.NewEnvelope(message.MessageTypePing, n.uuid.String(), n.selfAddr, n.cfg.TTL, payload)
+			if err != nil {
+				slog.Warn("failed to create ping envelope", slog.String("to", p.Addr), slog.String("error", err.Error()))
+				continue
+			}
+			data, err := env.Encode()
+			if err != nil {
+				slog.Warn("failed to encode ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
+				continue
+			}
+			if err := network.Send(p.Addr, data); err != nil {
+				slog.Debug("failed to send ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
+			}
+		}
+	}
 }
 
 func (n *Node) sendHelloTo(addr string) error {
@@ -90,6 +142,24 @@ func (n *Node) sendHelloToBootstrap() error {
 	return nil
 }
 
+// sendGetPeersToBootstrap sends GET_PEERS to the bootstrap so we receive PEERS_LIST and fill our peer list up to peer_limit.
+func (n *Node) sendGetPeersToBootstrap() error {
+	payload := message.GetPeersPayload{MaxPeers: n.cfg.PeerLimit}
+	env, err := message.NewEnvelope(message.MessageTypeGetPeers, n.uuid.String(), n.selfAddr, n.cfg.TTL, payload)
+	if err != nil {
+		return fmt.Errorf("create get_peers: %w", err)
+	}
+	data, err := env.Encode()
+	if err != nil {
+		return fmt.Errorf("encode get_peers: %w", err)
+	}
+	if err := network.Send(n.cfg.Bootstrap, data); err != nil {
+		return fmt.Errorf("send get_peers to bootstrap: %w", err)
+	}
+	slog.Info("get_peers sent to bootstrap", slog.String("bootstrap", n.cfg.Bootstrap), slog.Int("max_peers", n.cfg.PeerLimit))
+	return nil
+}
+
 func (n *Node) handlePacket(from *net.UDPAddr, data []byte) {
 	env, err := message.DecodeEnvelope(data)
 	if err != nil {
@@ -100,7 +170,13 @@ func (n *Node) handlePacket(from *net.UDPAddr, data []byte) {
 	if from != nil {
 		fromAddr = from.String()
 		if env.SenderID != "" && env.SenderID != n.uuid.String() {
-			n.peers.Add(env.SenderID, fromAddr)
+			// Use SenderAddr (where the peer is listening) so we can reach them for gossip/ping.
+			// fromAddr is the ephemeral UDP source port and is not where they listen.
+			peerAddr := fromAddr
+			if env.SenderAddr != "" {
+				peerAddr = env.SenderAddr
+			}
+			n.peers.Add(env.SenderID, peerAddr)
 		}
 	}
 
@@ -123,23 +199,41 @@ func (n *Node) handlePacket(from *net.UDPAddr, data []byte) {
 }
 
 func (n *Node) handleHello(fromAddr string, env message.Envelope) {
-	if fromAddr == "" {
+	if env.SenderID == "" || env.SenderID == n.uuid.String() {
 		return
 	}
-	slog.Info("hello received, replying", slog.String("from", fromAddr), slog.String("sender_id", env.SenderID))
-	if err := n.sendHelloTo(fromAddr); err != nil {
-		slog.Warn("failed to reply with hello", slog.String("to", fromAddr), slog.String("error", err.Error()))
+	// Reply with HELLO only once per sender to avoid infinite HELLO loop.
+	if n.helloReplied.Have(env.SenderID) {
+		slog.Debug("hello already replied to sender, skipping", slog.String("sender_id", env.SenderID))
+		return
+	}
+	n.helloReplied.Mark(env.SenderID)
+
+	replyTo := fromAddr
+	if env.SenderAddr != "" {
+		replyTo = env.SenderAddr
+	}
+	if replyTo == "" {
+		return
+	}
+	slog.Info("hello received, replying", slog.String("from", replyTo), slog.String("sender_id", env.SenderID))
+	if err := n.sendHelloTo(replyTo); err != nil {
+		slog.Warn("failed to reply with hello", slog.String("to", replyTo), slog.String("error", err.Error()))
 	}
 }
 
 func (n *Node) handleGetPeers(fromAddr string, env message.Envelope) {
-	if fromAddr == "" {
+	replyTo := fromAddr
+	if env.SenderAddr != "" {
+		replyTo = env.SenderAddr
+	}
+	if replyTo == "" {
 		return
 	}
 	// Decode the payload to get max_peers
 	payload, err := message.DecodePayload[message.GetPeersPayload](env)
 	if err != nil {
-		slog.Warn("failed to decode get_peers payload", slog.String("from", fromAddr), slog.String("error", err.Error()))
+		slog.Warn("failed to decode get_peers payload", slog.String("from", replyTo), slog.String("error", err.Error()))
 		return
 	}
 	// payload is now a message.GetPeersPayload
@@ -157,18 +251,18 @@ func (n *Node) handleGetPeers(fromAddr string, env message.Envelope) {
 		respPayload,
 	)
 	if err != nil {
-		slog.Warn("failed to create peers_list envelope", slog.String("to", fromAddr), slog.String("error", err.Error()))
+		slog.Warn("failed to create peers_list envelope", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
 	data, err := respEnv.Encode()
 	if err != nil {
-		slog.Warn("failed to encode peers_list envelope", slog.String("to", fromAddr), slog.String("error", err.Error()))
+		slog.Warn("failed to encode peers_list envelope", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
-	if err := network.Send(fromAddr, data); err != nil {
-		slog.Warn("failed to send peers_list", slog.String("to", fromAddr), slog.String("error", err.Error()))
+	if err := network.Send(replyTo, data); err != nil {
+		slog.Warn("failed to send peers_list", slog.String("to", replyTo), slog.String("error", err.Error()))
 	} else {
-		slog.Info("sent peers_list", slog.String("to", fromAddr), slog.Int("count", len(peers)))
+		slog.Info("sent peers_list", slog.String("to", replyTo), slog.Int("count", len(peers)))
 	}
 }
 
@@ -209,12 +303,37 @@ func (n *Node) handleGossip(fromAddr string, env message.Envelope) {
 		return
 	}
 	n.seen.Mark(msgKey)
-	slog.Info("gossip received", slog.String("topic", payload.Topic), slog.String("origin_id", payload.OriginID), slog.String("from", fromAddr))
+	// Log sender by listen address (SenderAddr), not UDP source port (fromAddr)
+	from := fromAddr
+	if env.SenderAddr != "" {
+		from = env.SenderAddr
+	}
+	slog.Info("gossip received", slog.String("topic", payload.Topic), slog.String("origin_id", payload.OriginID), slog.String("from", from))
 
 	// Forward to fanout peers if TTL allows (exclude sender)
 	if env.TTL > 0 {
 		n.forwardGossip(fromAddr, payload, env.TTL-1)
 	}
+}
+
+// PublishGossip starts a new gossip message (e.g. from CLI). It marks the message as seen and sends it to fanout peers.
+func (n *Node) PublishGossip(topic string, data string) {
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		slog.Warn("failed to marshal gossip data", slog.String("error", err.Error()))
+		return
+	}
+	originTs := time.Now().UnixMilli()
+	payload := message.GossipPayload{
+		Topic:             topic,
+		Data:              dataBytes,
+		OriginID:          n.uuid.String(),
+		OriginTimestampMs: originTs,
+	}
+	msgKey := payload.OriginID + ":" + strconv.FormatInt(payload.OriginTimestampMs, 10)
+	n.seen.Mark(msgKey)
+	slog.Info("gossip published", slog.String("topic", topic), slog.String("origin_id", n.uuid.String()))
+	n.forwardGossip("", payload, n.cfg.TTL)
 }
 
 func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, ttl int) {
@@ -253,42 +372,44 @@ func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, 
 }
 
 func (n *Node) handlePing(fromAddr string, env message.Envelope) {
-	if fromAddr == "" {
-		return
-	}
 	payload, err := message.DecodePayload[message.PingPayload](env)
 	if err != nil {
 		slog.Warn("failed to decode ping payload", slog.String("from", fromAddr), slog.String("error", err.Error()))
 		return
 	}
+	// Reply to SenderAddr (where the pinger is listening), not fromAddr (ephemeral UDP port).
+	replyTo := env.SenderAddr
+	if replyTo == "" {
+		replyTo = fromAddr
+	}
 	pongPayload := message.PongPayload{PingID: payload.PingID, Seq: payload.Seq}
 	pongEnv, err := message.NewEnvelope(message.MessageTypePong, n.uuid.String(), n.selfAddr, n.cfg.TTL, pongPayload)
 	if err != nil {
-		slog.Warn("failed to create pong envelope", slog.String("to", fromAddr), slog.String("error", err.Error()))
+		slog.Warn("failed to create pong envelope", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
 	data, err := pongEnv.Encode()
 	if err != nil {
-		slog.Warn("failed to encode pong", slog.String("to", fromAddr), slog.String("error", err.Error()))
+		slog.Warn("failed to encode pong", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
-	if err := network.Send(fromAddr, data); err != nil {
-		slog.Warn("failed to send pong", slog.String("to", fromAddr), slog.String("error", err.Error()))
+	if err := network.Send(replyTo, data); err != nil {
+		slog.Warn("failed to send pong", slog.String("to", replyTo), slog.String("error", err.Error()))
 	} else {
-		slog.Debug("pong sent", slog.String("to", fromAddr), slog.String("ping_id", payload.PingID))
+		slog.Debug("pong sent", slog.String("to", replyTo), slog.String("ping_id", payload.PingID))
 	}
 }
 
 func (n *Node) handlePong(fromAddr string, env message.Envelope) {
-	if fromAddr == "" {
-		return
-	}
 	_, err := message.DecodePayload[message.PongPayload](env)
 	if err != nil {
 		slog.Warn("failed to decode pong payload", slog.String("from", fromAddr), slog.String("error", err.Error()))
 		return
 	}
-	// Mark this peer as alive (updates LastSeenAt if already in store)
-	n.peers.Add(env.SenderID, fromAddr)
-	slog.Debug("pong received, peer alive", slog.String("from", fromAddr), slog.String("sender_id", env.SenderID))
+	// Mark this peer as alive. Use SenderAddr (where they listen) so we keep the correct address for future pings.
+	peerAddr := env.SenderAddr
+	if peerAddr == "" {
+		peerAddr = fromAddr
+	}
+	n.peers.Add(env.SenderID, peerAddr)
 }
