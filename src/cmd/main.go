@@ -37,6 +37,8 @@ func main() {
 	flag.IntVar(&cfg.PingInterval, "ping-interval", 1000, "Ping interval in milliseconds for this Node")
 	flag.IntVar(&cfg.PeerTimeout, "peer-timeout", 5000, "Peer timeout in milliseconds for this Node")
 	flag.Int64Var(&cfg.Seed, "seed", 1234567890, "Seed value for this Node")
+	flag.StringVar(&cfg.ExperimentLogPath, "experiment-log", "", "Path to append experiment metric lines (JSON)")
+	flag.StringVar(&cfg.NeighborsPolicy, "neighbors-policy", "first", "Fanout selection: 'first' or 'random'")
 
 	flag.Parse()
 

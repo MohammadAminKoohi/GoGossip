@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
+	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,14 +19,16 @@ import (
 )
 
 type Config struct {
-	Port         int
-	Bootstrap    string
-	Fanout       int
-	TTL          int
-	PeerLimit    int
-	PingInterval int
-	PeerTimeout  int
-	Seed         int64
+	Port             int
+	Bootstrap        string
+	Fanout           int
+	TTL              int
+	PeerLimit        int
+	PingInterval     int
+	PeerTimeout      int
+	Seed             int64
+	ExperimentLogPath string // if set, append JSON metric lines for experiment script
+	NeighborsPolicy   string // "first" (default) or "random" for fanout selection
 }
 
 type Node struct {
@@ -33,7 +38,10 @@ type Node struct {
 
 	peers        *peer.Store
 	seen         *seen.Set
-	helloReplied *seen.Set // sender IDs we've already sent a HELLO reply to (avoid infinite loop)
+	helloReplied *seen.Set
+
+	expLog   *os.File
+	expLogMu sync.Mutex
 }
 
 func New(cfg Config) (*Node, error) {
@@ -50,9 +58,44 @@ func New(cfg Config) (*Node, error) {
 		seen:         seen.NewSet(),
 		helloReplied: seen.NewSet(),
 	}
+	if cfg.ExperimentLogPath != "" {
+		f, err := os.OpenFile(cfg.ExperimentLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("open experiment log: %w", err)
+		}
+		n.expLog = f
+	}
+	if cfg.NeighborsPolicy == "random" && cfg.Seed != 0 {
+		rand.Seed(cfg.Seed)
+	}
 
 	slog.Info("node created", slog.String("uuid", n.uuid.String()), slog.String("addr", n.selfAddr))
 	return n, nil
+}
+
+// logExperiment writes a JSON line to the experiment log file (if configured).
+func (n *Node) logExperiment(obj map[string]interface{}) {
+	if n.expLog == nil {
+		return
+	}
+	n.expLogMu.Lock()
+	defer n.expLogMu.Unlock()
+	enc := json.NewEncoder(n.expLog)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(obj)
+}
+
+// sendWithLog sends data to addr and logs the send for experiment metrics if enabled.
+func (n *Node) sendWithLog(addr string, data []byte, msgType message.MessageType) error {
+	if n.expLog != nil {
+		n.logExperiment(map[string]interface{}{
+			"event":   "msg_sent",
+			"node_id": n.uuid.String(),
+			"type":    string(msgType),
+			"ts_ms":   time.Now().UnixMilli(),
+		})
+	}
+	return network.Send(addr, data)
 }
 
 // Start starts the node: listens for packets and runs the periodic ping loop in the background.
@@ -105,7 +148,7 @@ func (n *Node) runPingAndPruneLoop() {
 				slog.Warn("failed to encode ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
 				continue
 			}
-			if err := network.Send(p.Addr, data); err != nil {
+			if err := n.sendWithLog(p.Addr, data, message.MessageTypePing); err != nil {
 				slog.Debug("failed to send ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
 			}
 		}
@@ -127,7 +170,7 @@ func (n *Node) sendHelloTo(addr string) error {
 	if err != nil {
 		return fmt.Errorf("encode hello: %w", err)
 	}
-	if err := network.Send(addr, data); err != nil {
+	if err := n.sendWithLog(addr, data, message.MessageTypeHello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
 	slog.Debug("hello sent", slog.String("to", addr))
@@ -153,7 +196,7 @@ func (n *Node) sendGetPeersToBootstrap() error {
 	if err != nil {
 		return fmt.Errorf("encode get_peers: %w", err)
 	}
-	if err := network.Send(n.cfg.Bootstrap, data); err != nil {
+	if err := n.sendWithLog(n.cfg.Bootstrap, data, message.MessageTypeGetPeers); err != nil {
 		return fmt.Errorf("send get_peers to bootstrap: %w", err)
 	}
 	slog.Info("get_peers sent to bootstrap", slog.String("bootstrap", n.cfg.Bootstrap), slog.Int("max_peers", n.cfg.PeerLimit))
@@ -259,7 +302,7 @@ func (n *Node) handleGetPeers(fromAddr string, env message.Envelope) {
 		slog.Warn("failed to encode peers_list envelope", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
-	if err := network.Send(replyTo, data); err != nil {
+	if err := n.sendWithLog(replyTo, data, message.MessageTypePeers); err != nil {
 		slog.Warn("failed to send peers_list", slog.String("to", replyTo), slog.String("error", err.Error()))
 	} else {
 		slog.Info("sent peers_list", slog.String("to", replyTo), slog.Int("count", len(peers)))
@@ -303,6 +346,13 @@ func (n *Node) handleGossip(fromAddr string, env message.Envelope) {
 		return
 	}
 	n.seen.Mark(msgKey)
+	n.logExperiment(map[string]interface{}{
+		"event":    "gossip_recv",
+		"node_id":  n.uuid.String(),
+		"origin_id": payload.OriginID,
+		"origin_ts": payload.OriginTimestampMs,
+		"recv_ms":  time.Now().UnixMilli(),
+	})
 	// Log sender by listen address (SenderAddr), not UDP source port (fromAddr)
 	from := fromAddr
 	if env.SenderAddr != "" {
@@ -332,12 +382,22 @@ func (n *Node) PublishGossip(topic string, data string) {
 	}
 	msgKey := payload.OriginID + ":" + strconv.FormatInt(payload.OriginTimestampMs, 10)
 	n.seen.Mark(msgKey)
+	n.logExperiment(map[string]interface{}{
+		"event":     "gossip_publish",
+		"node_id":   n.uuid.String(),
+		"origin_id": payload.OriginID,
+		"origin_ts": payload.OriginTimestampMs,
+		"ts_ms":     originTs,
+	})
 	slog.Info("gossip published", slog.String("topic", topic), slog.String("origin_id", n.uuid.String()))
 	n.forwardGossip("", payload, n.cfg.TTL)
 }
 
 func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, ttl int) {
 	peers := n.peers.List()
+	if n.cfg.NeighborsPolicy == "random" && len(peers) > 1 {
+		rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	}
 	fanout := n.cfg.Fanout
 	if fanout <= 0 {
 		fanout = 1
@@ -360,7 +420,7 @@ func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, 
 			slog.Warn("failed to encode gossip forward", slog.String("to", p.Addr), slog.String("error", err.Error()))
 			continue
 		}
-		if err := network.Send(p.Addr, data); err != nil {
+		if err := n.sendWithLog(p.Addr, data, message.MessageTypeGossip); err != nil {
 			slog.Warn("failed to forward gossip", slog.String("to", p.Addr), slog.String("error", err.Error()))
 			continue
 		}
@@ -393,7 +453,7 @@ func (n *Node) handlePing(fromAddr string, env message.Envelope) {
 		slog.Warn("failed to encode pong", slog.String("to", replyTo), slog.String("error", err.Error()))
 		return
 	}
-	if err := network.Send(replyTo, data); err != nil {
+	if err := n.sendWithLog(replyTo, data, message.MessageTypePong); err != nil {
 		slog.Warn("failed to send pong", slog.String("to", replyTo), slog.String("error", err.Error()))
 	} else {
 		slog.Debug("pong sent", slog.String("to", replyTo), slog.String("ping_id", payload.PingID))
