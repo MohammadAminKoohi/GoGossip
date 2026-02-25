@@ -20,6 +20,8 @@ const (
 	MessageTypeGossip   MessageType = "GOSSIP"
 	MessageTypePing     MessageType = "PING"
 	MessageTypePong     MessageType = "PONG"
+	MessageTypeIHave    MessageType = "IHAVE"
+	MessageTypeIWant    MessageType = "IWANT"
 )
 
 type Envelope struct {
@@ -65,6 +67,17 @@ type PingPayload struct {
 type PongPayload struct {
 	PingID string `json:"ping_id"`
 	Seq    int64  `json:"seq"`
+}
+
+// IHavePayload is sent periodically to tell neighbors which message IDs we have.
+type IHavePayload struct {
+	IDs    []string `json:"ids"`
+	MaxIDs int      `json:"max_ids"`
+}
+
+// IWantPayload requests full GOSSIP messages for the given IDs.
+type IWantPayload struct {
+	IDs []string `json:"ids"`
 }
 
 func NewEnvelope(msgType MessageType, senderID, senderAddr string, ttl int, payload any) (Envelope, error) {
@@ -163,7 +176,7 @@ func (e Envelope) Validate() error {
 
 func (t MessageType) IsValid() bool {
 	switch t {
-	case MessageTypeHello, MessageTypeGetPeers, MessageTypePeers, MessageTypeGossip, MessageTypePing, MessageTypePong:
+	case MessageTypeHello, MessageTypeGetPeers, MessageTypePeers, MessageTypeGossip, MessageTypePing, MessageTypePong, MessageTypeIHave, MessageTypeIWant:
 		return true
 	default:
 		return false

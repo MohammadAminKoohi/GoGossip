@@ -18,17 +18,84 @@ import (
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/seen"
 )
 
+const defaultGossipCacheMax = 2000
+
 type Config struct {
-	Port             int
-	Bootstrap        string
-	Fanout           int
-	TTL              int
-	PeerLimit        int
-	PingInterval     int
-	PeerTimeout      int
-	Seed             int64
-	ExperimentLogPath string // if set, append JSON metric lines for experiment script
-	NeighborsPolicy   string // "first" (default) or "random" for fanout selection
+	Port               int
+	Bootstrap          string
+	Fanout             int
+	TTL                int
+	PeerLimit          int
+	PingInterval       int
+	PeerTimeout        int
+	Seed               int64
+	ExperimentLogPath  string // if set, append JSON metric lines for experiment script
+	NeighborsPolicy    string // "first" (default) or "random" for fanout selection
+	PullInterval       int    // ms; if > 0, send IHAVE to neighbors at this interval
+	IHaveMaxIds        int    // max message IDs to put in one IHAVE message
+	GossipCacheMaxSize int    // max gossip payloads to cache for IWANT responses (0 = default)
+}
+
+// gossipCache stores recent gossip payloads by id (origin_id:origin_ts) for IWANT responses.
+type gossipCache struct {
+	mu    sync.RWMutex
+	items map[string]message.GossipPayload
+	order []string
+	max   int
+}
+
+func newGossipCache(maxSize int) *gossipCache {
+	if maxSize <= 0 {
+		maxSize = defaultGossipCacheMax
+	}
+	return &gossipCache{items: make(map[string]message.GossipPayload), max: maxSize}
+}
+
+func (c *gossipCache) Add(id string, payload message.GossipPayload) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.items[id]; ok {
+		// move to end of order (most recent)
+		for i, x := range c.order {
+			if x == id {
+				c.order = append(append(c.order[:i], c.order[i+1:]...), id)
+				break
+			}
+		}
+		return
+	}
+	if len(c.order) >= c.max {
+		old := c.order[0]
+		c.order = c.order[1:]
+		delete(c.items, old)
+	}
+	c.items[id] = payload
+	c.order = append(c.order, id)
+}
+
+func (c *gossipCache) Get(id string) (message.GossipPayload, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	p, ok := c.items[id]
+	return p, ok
+}
+
+// ListIDs returns up to max IDs (most recent first by insertion order).
+func (c *gossipCache) ListIDs(max int) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if max <= 0 || len(c.order) == 0 {
+		return nil
+	}
+	start := len(c.order) - max
+	if start < 0 {
+		start = 0
+	}
+	ids := make([]string, 0, max)
+	for i := len(c.order) - 1; i >= start && len(ids) < max; i-- {
+		ids = append(ids, c.order[i])
+	}
+	return ids
 }
 
 type Node struct {
@@ -39,6 +106,7 @@ type Node struct {
 	peers        *peer.Store
 	seen         *seen.Set
 	helloReplied *seen.Set
+	gossipCache  *gossipCache
 
 	expLog   *os.File
 	expLogMu sync.Mutex
@@ -50,6 +118,10 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
 	}
 
+	cacheMax := cfg.GossipCacheMaxSize
+	if cacheMax <= 0 {
+		cacheMax = defaultGossipCacheMax
+	}
 	n := &Node{
 		cfg:          cfg,
 		selfAddr:     fmt.Sprintf("127.0.0.1:%d", cfg.Port),
@@ -57,6 +129,7 @@ func New(cfg Config) (*Node, error) {
 		peers:        peer.NewStore(cfg.PeerLimit, cfg.PeerTimeout),
 		seen:         seen.NewSet(),
 		helloReplied: seen.NewSet(),
+		gossipCache:  newGossipCache(cacheMax),
 	}
 	if cfg.ExperimentLogPath != "" {
 		f, err := os.OpenFile(cfg.ExperimentLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -107,6 +180,9 @@ func (n *Node) Start() error {
 		}
 	}()
 	go n.runPingAndPruneLoop()
+	if n.cfg.PullInterval > 0 {
+		go n.runPullLoop()
+	}
 	if n.cfg.Bootstrap != "" {
 		if err := n.sendHelloToBootstrap(); err != nil {
 			return err
@@ -151,6 +227,59 @@ func (n *Node) runPingAndPruneLoop() {
 			if err := n.sendWithLog(p.Addr, data, message.MessageTypePing); err != nil {
 				slog.Debug("failed to send ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
 			}
+		}
+	}
+}
+
+// runPullLoop sends IHAVE to some neighbors every PullInterval.
+func (n *Node) runPullLoop() {
+	interval := time.Duration(n.cfg.PullInterval) * time.Millisecond
+	if interval <= 0 {
+		return
+	}
+	maxIds := n.cfg.IHaveMaxIds
+	if maxIds <= 0 {
+		maxIds = 32
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		ids := n.gossipCache.ListIDs(maxIds)
+		if len(ids) == 0 {
+			continue
+		}
+		peers := n.peers.List()
+		if n.cfg.NeighborsPolicy == "random" && len(peers) > 1 {
+			rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+		}
+		fanout := n.cfg.Fanout
+		if fanout <= 0 {
+			fanout = 1
+		}
+		sent := 0
+		for _, p := range peers {
+			if sent >= fanout {
+				break
+			}
+			if p.NodeID == n.uuid.String() {
+				continue
+			}
+			payload := message.IHavePayload{IDs: ids, MaxIDs: maxIds}
+			env, err := message.NewEnvelope(message.MessageTypeIHave, n.uuid.String(), n.selfAddr, n.cfg.TTL, payload)
+			if err != nil {
+				continue
+			}
+			data, err := env.Encode()
+			if err != nil {
+				continue
+			}
+			if err := n.sendWithLog(p.Addr, data, message.MessageTypeIHave); err != nil {
+				continue
+			}
+			sent++
+		}
+		if sent > 0 {
+			slog.Info("IHAVE sent", slog.Int("peers", sent), slog.Int("ids", len(ids)))
 		}
 	}
 }
@@ -236,6 +365,10 @@ func (n *Node) handlePacket(from *net.UDPAddr, data []byte) {
 		n.handlePing(fromAddr, env)
 	case message.MessageTypePong:
 		n.handlePong(fromAddr, env)
+	case message.MessageTypeIHave:
+		n.handleIHave(fromAddr, env)
+	case message.MessageTypeIWant:
+		n.handleIWant(fromAddr, env)
 	default:
 		slog.Warn("unknown message type", slog.String("msg_type", string(env.MsgType)))
 	}
@@ -346,6 +479,7 @@ func (n *Node) handleGossip(fromAddr string, env message.Envelope) {
 		return
 	}
 	n.seen.Mark(msgKey)
+	n.gossipCache.Add(msgKey, payload)
 	n.logExperiment(map[string]interface{}{
 		"event":    "gossip_recv",
 		"node_id":  n.uuid.String(),
@@ -358,7 +492,11 @@ func (n *Node) handleGossip(fromAddr string, env message.Envelope) {
 	if env.SenderAddr != "" {
 		from = env.SenderAddr
 	}
-	slog.Info("gossip received", slog.String("topic", payload.Topic), slog.String("origin_id", payload.OriginID), slog.String("from", from))
+	if env.TTL == 0 {
+		slog.Info("gossip received via pull (IWANT response)", slog.String("topic", payload.Topic), slog.String("origin_id", payload.OriginID), slog.String("from", from))
+	} else {
+		slog.Info("gossip received", slog.String("topic", payload.Topic), slog.String("origin_id", payload.OriginID), slog.String("from", from))
+	}
 
 	// Forward to fanout peers if TTL allows (exclude sender)
 	if env.TTL > 0 {
@@ -389,6 +527,7 @@ func (n *Node) PublishGossip(topic string, data string) {
 		"origin_ts": payload.OriginTimestampMs,
 		"ts_ms":     originTs,
 	})
+	n.gossipCache.Add(msgKey, payload)
 	slog.Info("gossip published", slog.String("topic", topic), slog.String("origin_id", n.uuid.String()))
 	n.forwardGossip("", payload, n.cfg.TTL)
 }
@@ -428,6 +567,87 @@ func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, 
 	}
 	if sent > 0 {
 		slog.Debug("gossip forwarded", slog.Int("count", sent), slog.Int("ttl", ttl))
+	}
+}
+
+// sendGossipTo sends a single GOSSIP message to one address (e.g. IWANT response).
+func (n *Node) sendGossipTo(addr string, payload message.GossipPayload, ttl int) error {
+	env, err := message.NewEnvelope(message.MessageTypeGossip, n.uuid.String(), n.selfAddr, ttl, payload)
+	if err != nil {
+		return err
+	}
+	data, err := env.Encode()
+	if err != nil {
+		return err
+	}
+	return n.sendWithLog(addr, data, message.MessageTypeGossip)
+}
+
+func (n *Node) handleIHave(fromAddr string, env message.Envelope) {
+	replyTo := fromAddr
+	if env.SenderAddr != "" {
+		replyTo = env.SenderAddr
+	}
+	if replyTo == "" {
+		return
+	}
+	payload, err := message.DecodePayload[message.IHavePayload](env)
+	if err != nil {
+		slog.Warn("failed to decode IHAVE payload", slog.String("from", replyTo), slog.String("error", err.Error()))
+		return
+	}
+	var wantIds []string
+	for _, id := range payload.IDs {
+		if id != "" && !n.seen.Have(id) {
+			wantIds = append(wantIds, id)
+		}
+	}
+	if len(wantIds) == 0 {
+		return
+	}
+	iwantPayload := message.IWantPayload{IDs: wantIds}
+	iwantEnv, err := message.NewEnvelope(message.MessageTypeIWant, n.uuid.String(), n.selfAddr, n.cfg.TTL, iwantPayload)
+	if err != nil {
+		slog.Warn("failed to create IWANT envelope", slog.String("to", replyTo), slog.String("error", err.Error()))
+		return
+	}
+	data, err := iwantEnv.Encode()
+	if err != nil {
+		slog.Warn("failed to encode IWANT", slog.String("to", replyTo), slog.String("error", err.Error()))
+		return
+	}
+	if err := n.sendWithLog(replyTo, data, message.MessageTypeIWant); err != nil {
+		slog.Warn("failed to send IWANT", slog.String("to", replyTo), slog.String("error", err.Error()))
+	} else {
+		slog.Debug("IWANT sent", slog.String("to", replyTo), slog.Int("count", len(wantIds)))
+	}
+}
+
+func (n *Node) handleIWant(fromAddr string, env message.Envelope) {
+	replyTo := fromAddr
+	if env.SenderAddr != "" {
+		replyTo = env.SenderAddr
+	}
+	if replyTo == "" {
+		return
+	}
+	payload, err := message.DecodePayload[message.IWantPayload](env)
+	if err != nil {
+		slog.Warn("failed to decode IWANT payload", slog.String("from", replyTo), slog.String("error", err.Error()))
+		return
+	}
+	for _, id := range payload.IDs {
+		if id == "" {
+			continue
+		}
+		gossipPayload, ok := n.gossipCache.Get(id)
+		if !ok {
+			continue
+		}
+		// Send full GOSSIP to requestor; TTL=0 so they don't re-forward (they will process and cache).
+		if err := n.sendGossipTo(replyTo, gossipPayload, 0); err != nil {
+			slog.Debug("failed to send GOSSIP for IWANT", slog.String("id", id), slog.String("to", replyTo), slog.String("error", err.Error()))
+		}
 	}
 }
 

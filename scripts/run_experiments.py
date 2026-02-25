@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Run gossip network experiments for N in {10, 20, 50}, 5 seeds per N.
-Vary TTL, fanout, and neighbors policy. Compute convergence time (95%) and message overhead.
-Output CSV and plots (N vs convergence time, N vs overhead).
+Run gossip experiments in four parts:
+
+  1. N×seed: Effect of N and seeds. Normal config. Two versions: push-only and push-pull hybrid.
+  2. TTL:    Only change TTL; fix others; push-only.
+  3. Policy: Only change policy; fix others; push-only.
+  4. Fanout: Only change fanout; fix others; push-only.
+
+Normal config: ttl=10, fanout=3, policy=first.
 """
 
 import argparse
 import json
 import math
-import os
 import subprocess
 import sys
 import tempfile
@@ -23,24 +27,30 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-# Defaults
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BINARY_NAME = "gogossip"
 STABILIZE_SEC = 20
 CONVERGENCE_WAIT_SEC = 35
 NODES_LIST = [10, 20, 50]
 NUM_SEEDS = 5
+COVERAGE_FRAC = 0.95
+IHAVE_MAX_IDS = 32
+# Pull interval for hybrid (near ping so convergence isn't delayed by next IHAVE)
+PULL_MS_HYBRID = 1000
+
+# Normal config (used when not varying that parameter)
+TTL_NORMAL = 10
+FANOUT_NORMAL = 3
+POLICY_NORMAL = "first"
+
 TTL_VALUES = [5, 10, 20]
 FANOUT_VALUES = [2, 3, 5]
 POLICY_VALUES = ["first", "random"]
-COVERAGE_FRAC = 0.95
 
 
 def build_binary(project_root: Path) -> Path:
-    """Build the Go binary; return path to it."""
     binary = project_root / BINARY_NAME
-    cmd = ["go", "build", "-o", str(binary), "./src/cmd/..."]
-    subprocess.run(cmd, cwd=project_root, check=True)
+    subprocess.run(["go", "build", "-o", str(binary), "./src/cmd/..."], cwd=project_root, check=True)
     return binary
 
 
@@ -53,56 +63,43 @@ def run_single_experiment(
     fanout: int,
     policy: str,
     log_dir: Path,
-    peer_limit: int = 100,
+    pull_interval_ms: int = 0,
 ) -> tuple[float | None, int | None]:
-    """
-    Start N nodes, inject one gossip from node 0, wait, then parse logs.
-    Returns (convergence_ms, overhead) or (None, None) on failure.
-    """
     base_port = 8000
     processes = []
     log_files = []
-
     try:
         for i in range(n_nodes):
             port = base_port + i
             log_path = log_dir / f"node_{i}.log"
             log_files.append(log_path)
-            log_path.write_text("")  # clear
-
+            log_path.write_text("")
             args = [
                 str(binary),
                 "-port", str(port),
                 "-fanout", str(fanout),
                 "-ttl", str(ttl),
-                "-peer-limit", str(peer_limit),
+                "-peer-limit", "100",
                 "-experiment-log", str(log_path),
                 "-neighbors-policy", policy,
                 "-seed", str(12345 + run_id * 1000 + i),
             ]
+            if pull_interval_ms > 0:
+                args.extend(["-pull-interval", str(pull_interval_ms), "-ihave-max-ids", str(IHAVE_MAX_IDS)])
             if i > 0:
                 args.extend(["-bootstrap", f"127.0.0.1:{base_port}"])
-
             proc = subprocess.Popen(
-                args,
-                cwd=project_root,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                args, cwd=project_root, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             processes.append(proc)
-
         time.sleep(STABILIZE_SEC)
-
-        # Inject one message from node 0 (seed)
         try:
             processes[0].stdin.write(b"__experiment_trigger__\n")
             processes[0].stdin.flush()
         except Exception:
             pass
-
         time.sleep(CONVERGENCE_WAIT_SEC)
-
     finally:
         for p in processes:
             try:
@@ -113,21 +110,13 @@ def run_single_experiment(
                     p.kill()
                 except Exception:
                     pass
-
-    # Parse logs
     return parse_experiment_logs(log_files, n_nodes)
 
 
 def parse_experiment_logs(log_files: list[Path], n_nodes: int) -> tuple[float | None, int | None]:
-    """
-    From experiment log files, get t0 (publish time), recv times per node, and msg_sent counts in [t0, t_95].
-    Returns (convergence_ms, overhead).
-    """
-    # Collect events from all files
     publish_events = []
     recv_events = []
     sent_events = []
-
     for path in log_files:
         if not path.exists():
             continue
@@ -146,18 +135,14 @@ def parse_experiment_logs(log_files: list[Path], n_nodes: int) -> tuple[float | 
                 recv_events.append(obj)
             elif ev == "msg_sent":
                 sent_events.append(obj)
-
     if not publish_events:
         return None, None
-    # Use first publish as the test message
     pub = publish_events[0]
     t0 = pub.get("ts_ms")
     origin_id = pub.get("origin_id")
     origin_ts = pub.get("origin_ts")
     if t0 is None or origin_id is None or origin_ts is None:
         return None, None
-
-    # Recv times for this message (by origin_id + origin_ts)
     recv_times = []
     for r in recv_events:
         if r.get("origin_id") == origin_id and r.get("origin_ts") == origin_ts:
@@ -165,67 +150,172 @@ def parse_experiment_logs(log_files: list[Path], n_nodes: int) -> tuple[float | 
     recv_times = [t for t in recv_times if t is not None]
     if not recv_times:
         return None, None
-
-    # 95% convergence: time by which 95% of nodes have received
     k = max(1, math.ceil(COVERAGE_FRAC * n_nodes))
     recv_times_sorted = sorted(recv_times)
-    if k > len(recv_times_sorted):
-        t_95 = recv_times_sorted[-1]
-    else:
-        t_95 = recv_times_sorted[k - 1]
-
+    t_95 = recv_times_sorted[k - 1] if k <= len(recv_times_sorted) else recv_times_sorted[-1]
     convergence_ms = float(t_95 - t0)
-
-    # Overhead: all msg_sent in [t0, t_95]
     overhead = sum(1 for s in sent_events if (s.get("ts_ms") or 0) >= t0 and (s.get("ts_ms") or 0) <= t_95)
-
     return convergence_ms, overhead
 
 
-def run_all_experiments(
+def run_n_seed_test(
+    binary: Path,
     project_root: Path,
-    out_dir: Path,
     nodes_list: list[int],
     num_seeds: int,
-    ttl_values: list[int],
-    fanout_values: list[int],
-    policy_values: list[str],
 ) -> list[dict]:
-    """Run experiments and return list of result rows."""
-    binary = build_binary(project_root)
+    """Part 1: N×seed with normal config. Two versions: push-only and push-pull hybrid."""
     results = []
-
-    total = (
-        len(nodes_list) * num_seeds * len(ttl_values) * len(fanout_values) * len(policy_values)
-    )
+    total = len(nodes_list) * num_seeds * 2  # push + hybrid
     run_idx = 0
-
     for n_nodes in nodes_list:
         for run_id in range(num_seeds):
-            for ttl in ttl_values:
-                for fanout in fanout_values:
-                    for policy in policy_values:
-                        run_idx += 1
-                        print(f"[{run_idx}/{total}] N={n_nodes} seed={run_id} ttl={ttl} fanout={fanout} policy={policy} ...")
-                        with tempfile.TemporaryDirectory(prefix="gossip_exp_") as log_dir:
-                            log_path = Path(log_dir)
-                            conv_ms, overhead = run_single_experiment(
-                                binary, project_root, n_nodes, run_id, ttl, fanout, policy, log_path
-                            )
-                        if conv_ms is not None and overhead is not None:
-                            results.append({
-                                "N": n_nodes,
-                                "run": run_id,
-                                "ttl": ttl,
-                                "fanout": fanout,
-                                "policy": policy,
-                                "convergence_ms": conv_ms,
-                                "overhead": overhead,
-                            })
-                            print(f"  -> convergence={conv_ms:.0f} ms, overhead={overhead}")
-                        else:
-                            print("  -> (parse failed, skipping)")
+            for pull_ms in [0, PULL_MS_HYBRID]:
+                run_idx += 1
+                mode = "hybrid" if pull_ms else "push_only"
+                print(f"[N×seed {run_idx}/{total}] N={n_nodes} seed={run_id} {mode} ...")
+                with tempfile.TemporaryDirectory(prefix="gossip_") as log_dir:
+                    conv_ms, overhead = run_single_experiment(
+                        binary, project_root, n_nodes, run_id,
+                        ttl=TTL_NORMAL, fanout=FANOUT_NORMAL, policy=POLICY_NORMAL,
+                        log_dir=Path(log_dir), pull_interval_ms=pull_ms,
+                    )
+                if conv_ms is not None and overhead is not None:
+                    results.append({
+                        "test": "n_seed",
+                        "N": n_nodes,
+                        "run": run_id,
+                        "vary": f"N={n_nodes}_seed={run_id}",
+                        "ttl": TTL_NORMAL,
+                        "fanout": FANOUT_NORMAL,
+                        "policy": POLICY_NORMAL,
+                        "pull_interval_ms": pull_ms,
+                        "convergence_ms": conv_ms,
+                        "overhead": overhead,
+                    })
+                    print(f"  -> convergence={conv_ms:.0f} ms, overhead={overhead}")
+                else:
+                    print("  -> (parse failed)")
+    return results
 
+
+def run_ttl_test(
+    binary: Path,
+    project_root: Path,
+    nodes_list: list[int],
+    num_seeds: int,
+) -> list[dict]:
+    """Part 2: Vary TTL only; normal fanout, policy. Push-only. N×seed combinations."""
+    results = []
+    total = len(nodes_list) * num_seeds * len(TTL_VALUES)
+    run_idx = 0
+    for n_nodes in nodes_list:
+        for run_id in range(num_seeds):
+            for ttl in TTL_VALUES:
+                run_idx += 1
+                print(f"[TTL {run_idx}/{total}] N={n_nodes} seed={run_id} ttl={ttl} push_only ...")
+                with tempfile.TemporaryDirectory(prefix="gossip_") as log_dir:
+                    conv_ms, overhead = run_single_experiment(
+                        binary, project_root, n_nodes, run_id,
+                        ttl=ttl, fanout=FANOUT_NORMAL, policy=POLICY_NORMAL,
+                        log_dir=Path(log_dir), pull_interval_ms=0,
+                    )
+                if conv_ms is not None and overhead is not None:
+                    results.append({
+                        "test": "ttl",
+                        "N": n_nodes,
+                        "run": run_id,
+                        "vary": f"ttl={ttl}",
+                        "ttl": ttl,
+                        "fanout": FANOUT_NORMAL,
+                        "policy": POLICY_NORMAL,
+                        "pull_interval_ms": 0,
+                        "convergence_ms": conv_ms,
+                        "overhead": overhead,
+                    })
+                    print(f"  -> convergence={conv_ms:.0f} ms, overhead={overhead}")
+                else:
+                    print("  -> (parse failed)")
+    return results
+
+
+def run_policy_test(
+    binary: Path,
+    project_root: Path,
+    nodes_list: list[int],
+    num_seeds: int,
+) -> list[dict]:
+    """Part 3: Vary policy only; normal ttl, fanout. Push-only. N×seed combinations."""
+    results = []
+    total = len(nodes_list) * num_seeds * len(POLICY_VALUES)
+    run_idx = 0
+    for n_nodes in nodes_list:
+        for run_id in range(num_seeds):
+            for policy in POLICY_VALUES:
+                run_idx += 1
+                print(f"[Policy {run_idx}/{total}] N={n_nodes} seed={run_id} policy={policy} push_only ...")
+                with tempfile.TemporaryDirectory(prefix="gossip_") as log_dir:
+                    conv_ms, overhead = run_single_experiment(
+                        binary, project_root, n_nodes, run_id,
+                        ttl=TTL_NORMAL, fanout=FANOUT_NORMAL, policy=policy,
+                        log_dir=Path(log_dir), pull_interval_ms=0,
+                    )
+                if conv_ms is not None and overhead is not None:
+                    results.append({
+                        "test": "policy",
+                        "N": n_nodes,
+                        "run": run_id,
+                        "vary": f"policy={policy}",
+                        "ttl": TTL_NORMAL,
+                        "fanout": FANOUT_NORMAL,
+                        "policy": policy,
+                        "pull_interval_ms": 0,
+                        "convergence_ms": conv_ms,
+                        "overhead": overhead,
+                    })
+                    print(f"  -> convergence={conv_ms:.0f} ms, overhead={overhead}")
+                else:
+                    print("  -> (parse failed)")
+    return results
+
+
+def run_fanout_test(
+    binary: Path,
+    project_root: Path,
+    nodes_list: list[int],
+    num_seeds: int,
+) -> list[dict]:
+    """Part 4: Vary fanout only; normal ttl, policy. Push-only. N×seed combinations."""
+    results = []
+    total = len(nodes_list) * num_seeds * len(FANOUT_VALUES)
+    run_idx = 0
+    for n_nodes in nodes_list:
+        for run_id in range(num_seeds):
+            for fanout in FANOUT_VALUES:
+                run_idx += 1
+                print(f"[Fanout {run_idx}/{total}] N={n_nodes} seed={run_id} fanout={fanout} push_only ...")
+                with tempfile.TemporaryDirectory(prefix="gossip_") as log_dir:
+                    conv_ms, overhead = run_single_experiment(
+                        binary, project_root, n_nodes, run_id,
+                        ttl=TTL_NORMAL, fanout=fanout, policy=POLICY_NORMAL,
+                        log_dir=Path(log_dir), pull_interval_ms=0,
+                    )
+                if conv_ms is not None and overhead is not None:
+                    results.append({
+                        "test": "fanout",
+                        "N": n_nodes,
+                        "run": run_id,
+                        "vary": f"fanout={fanout}",
+                        "ttl": TTL_NORMAL,
+                        "fanout": fanout,
+                        "policy": POLICY_NORMAL,
+                        "pull_interval_ms": 0,
+                        "convergence_ms": conv_ms,
+                        "overhead": overhead,
+                    })
+                    print(f"  -> convergence={conv_ms:.0f} ms, overhead={overhead}")
+                else:
+                    print("  -> (parse failed)")
     return results
 
 
@@ -239,140 +329,159 @@ def write_csv(results: list[dict], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def plot_results(results: list[dict], out_dir: Path) -> None:
+def plot_n_seed_results(results: list[dict], out_dir: Path) -> None:
+    """Part 1: Convergence and overhead vs N; two curves = push_only vs hybrid (mean over seeds)."""
     if not HAS_MATPLOTLIB or not results:
         return
-
-    import numpy as np
-
-    # Aggregate: for each (N, ttl, fanout, policy) take mean over runs
     from collections import defaultdict
+    import numpy as np
     agg = defaultdict(list)
     for r in results:
-        key = (r["N"], r["ttl"], r["fanout"], r["policy"])
+        key = (r["N"], r["pull_interval_ms"])
         agg[key].append(r)
-
     nodes_list = sorted({r["N"] for r in results})
-    ttl_vals = sorted({r["ttl"] for r in results})
-    fanout_vals = sorted({r["fanout"] for r in results})
-    policy_vals = sorted({r["policy"] for r in results})
+    pull_vals = sorted({r["pull_interval_ms"] for r in results})
 
-    def mean_convergence(key):
+    def mean_conv(key):
         return np.mean([x["convergence_ms"] for x in agg[key]])
 
     def mean_overhead(key):
         return np.mean([x["overhead"] for x in agg[key]])
 
-    # Plot 1: Convergence time vs N, one curve per (ttl, fanout, policy) or simplified
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for ttl in ttl_vals:
-        for fanout in fanout_vals:
-            for policy in policy_vals:
-                label = f"ttl={ttl} fanout={fanout} {policy}"
-                x, y = [], []
-                for N in nodes_list:
-                    key = (N, ttl, fanout, policy)
-                    if key in agg and agg[key]:
-                        x.append(N)
-                        y.append(mean_convergence(key))
-                if x:
-                    ax.plot(x, y, "o-", label=label)
-    ax.set_xlabel("N (number of nodes)")
-    ax.set_ylabel("Convergence time (ms)")
-    ax.set_title("95% Convergence time vs N")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(out_dir / "convergence_vs_N.png", dpi=120, bbox_inches="tight")
-    plt.close()
-
-    # Plot 2: Overhead vs N
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for ttl in ttl_vals:
-        for fanout in fanout_vals:
-            for policy in policy_vals:
-                label = f"ttl={ttl} fanout={fanout} {policy}"
-                x, y = [], []
-                for N in nodes_list:
-                    key = (N, ttl, fanout, policy)
-                    if key in agg and agg[key]:
-                        x.append(N)
-                        y.append(mean_overhead(key))
-                if x:
-                    ax.plot(x, y, "s-", label=label)
-    ax.set_xlabel("N (number of nodes)")
-    ax.set_ylabel("Message overhead (count)")
-    ax.set_title("Message overhead (until 95% coverage) vs N")
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(out_dir / "overhead_vs_N.png", dpi=120, bbox_inches="tight")
-    plt.close()
-
-    # Simpler plots: fix fanout and policy, vary TTL
-    default_fanout = fanout_vals[0] if fanout_vals else 3
-    default_policy = policy_vals[0] if policy_vals else "first"
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-    for ttl in ttl_vals:
-        label = f"TTL={ttl}"
+    for pull_ms in pull_vals:
+        label = "push-pull hybrid" if pull_ms else "push only"
         x, y1, y2 = [], [], []
         for N in nodes_list:
-            key = (N, ttl, default_fanout, default_policy)
+            key = (N, pull_ms)
             if key in agg and agg[key]:
                 x.append(N)
-                y1.append(mean_convergence(key))
+                y1.append(mean_conv(key))
                 y2.append(mean_overhead(key))
         if x:
             ax1.plot(x, y1, "o-", label=label)
             ax2.plot(x, y2, "s-", label=label)
     ax1.set_xlabel("N")
     ax1.set_ylabel("Convergence (ms)")
-    ax1.set_title("Convergence vs N (fanout=3, first)")
+    ax1.set_title("Part 1: N×seed — Convergence vs N (mean over seeds)")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     ax2.set_xlabel("N")
     ax2.set_ylabel("Overhead")
-    ax2.set_title("Overhead vs N (fanout=3, first)")
+    ax2.set_title("Part 1: N×seed — Overhead vs N (mean over seeds)")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     plt.tight_layout()
-    fig.savefig(out_dir / "ttl_effect.png", dpi=120, bbox_inches="tight")
+    fig.savefig(out_dir / "plot_n_seed.png", dpi=120, bbox_inches="tight")
+    plt.close()
+
+
+def plot_focused_results(results: list[dict], out_dir: Path, test_name: str) -> None:
+    """Plot convergence and overhead vs N for one test; curves = vary (push-only for ttl/policy/fanout)."""
+    if not HAS_MATPLOTLIB or not results:
+        return
+    from collections import defaultdict
+    import numpy as np
+    agg = defaultdict(list)
+    for r in results:
+        key = (r["N"], r["vary"], r["pull_interval_ms"])
+        agg[key].append(r)
+    nodes_list = sorted({r["N"] for r in results})
+    vary_vals = sorted({r["vary"] for r in results})
+    pull_vals = sorted({r["pull_interval_ms"] for r in results})
+
+    def mean_conv(key):
+        return np.mean([x["convergence_ms"] for x in agg[key]])
+
+    def mean_overhead(key):
+        return np.mean([x["overhead"] for x in agg[key]])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    for vary in vary_vals:
+        for pull_ms in pull_vals:
+            label = f"{vary}" + (" hybrid" if pull_ms else " push_only")
+            x, y1, y2 = [], [], []
+            for N in nodes_list:
+                key = (N, vary, pull_ms)
+                if key in agg and agg[key]:
+                    x.append(N)
+                    y1.append(mean_conv(key))
+                    y2.append(mean_overhead(key))
+            if x:
+                ax1.plot(x, y1, "o-", label=label)
+                ax2.plot(x, y2, "s-", label=label)
+    ax1.set_xlabel("N")
+    ax1.set_ylabel("Convergence (ms)")
+    ax1.set_title(f"Test: {test_name} — Convergence vs N (push only)")
+    ax1.legend(fontsize=8)
+    ax1.grid(True, alpha=0.3)
+    ax2.set_xlabel("N")
+    ax2.set_ylabel("Overhead")
+    ax2.set_title(f"Test: {test_name} — Overhead vs N (push only)")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_dir / f"plot_{test_name}.png", dpi=120, bbox_inches="tight")
     plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run gossip experiments")
-    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT, help="Go project root")
-    parser.add_argument("--out-dir", type=Path, default=None, help="Output directory (default: project_root/experiment_results)")
-    parser.add_argument("--N", type=int, nargs="+", default=NODES_LIST, help="Node counts")
-    parser.add_argument("--seeds", type=int, default=NUM_SEEDS, help="Number of runs per config")
-    parser.add_argument("--ttl", type=int, nargs="+", default=TTL_VALUES, help="TTL values")
-    parser.add_argument("--fanout", type=int, nargs="+", default=FANOUT_VALUES, help="Fanout values")
-    parser.add_argument("--policy", type=str, nargs="+", default=POLICY_VALUES, help="Neighbors policy")
-    parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
+    parser = argparse.ArgumentParser(
+        description="Run experiments: part 1 N×seed (push+hybrid), parts 2–4 ttl/policy/fanout (push only)."
+    )
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--test", choices=["n_seed", "ttl", "policy", "fanout", "all"], default="all",
+                        help="Part to run: n_seed, ttl, policy, fanout, or all")
+    parser.add_argument("--N", type=int, nargs="+", default=NODES_LIST)
+    parser.add_argument("--seeds", type=int, default=NUM_SEEDS)
+    parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
 
     out_dir = args.out_dir or args.project_root / "experiment_results"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = run_all_experiments(
-        args.project_root,
-        out_dir,
-        nodes_list=args.N,
-        num_seeds=args.seeds,
-        ttl_values=args.ttl,
-        fanout_values=args.fanout,
-        policy_values=args.policy,
-    )
+    binary = build_binary(args.project_root)
+    nodes_list = args.N
+    num_seeds = args.seeds
+    all_results = []
 
-    csv_path = out_dir / "results.csv"
-    write_csv(results, csv_path)
-    print(f"Wrote {csv_path} ({len(results)} rows)")
+    if args.test in ("n_seed", "all"):
+        results_n_seed = run_n_seed_test(binary, args.project_root, nodes_list, num_seeds)
+        write_csv(results_n_seed, out_dir / "results_n_seed.csv")
+        print(f"Wrote {out_dir / 'results_n_seed.csv'} ({len(results_n_seed)} rows)")
+        all_results.extend(results_n_seed)
+        if not args.no_plot and results_n_seed:
+            plot_n_seed_results(results_n_seed, out_dir)
 
-    if not args.no_plot and results:
-        plot_results(results, out_dir)
-        print(f"Plots saved in {out_dir}")
-    elif not HAS_MATPLOTLIB and not args.no_plot:
+    if args.test in ("ttl", "all"):
+        results_ttl = run_ttl_test(binary, args.project_root, nodes_list, num_seeds)
+        write_csv(results_ttl, out_dir / "results_ttl.csv")
+        print(f"Wrote {out_dir / 'results_ttl.csv'} ({len(results_ttl)} rows)")
+        all_results.extend(results_ttl)
+        if not args.no_plot and results_ttl:
+            plot_focused_results(results_ttl, out_dir, "ttl")
+
+    if args.test in ("policy", "all"):
+        results_policy = run_policy_test(binary, args.project_root, nodes_list, num_seeds)
+        write_csv(results_policy, out_dir / "results_policy.csv")
+        print(f"Wrote {out_dir / 'results_policy.csv'} ({len(results_policy)} rows)")
+        all_results.extend(results_policy)
+        if not args.no_plot and results_policy:
+            plot_focused_results(results_policy, out_dir, "policy")
+
+    if args.test in ("fanout", "all"):
+        results_fanout = run_fanout_test(binary, args.project_root, nodes_list, num_seeds)
+        write_csv(results_fanout, out_dir / "results_fanout.csv")
+        print(f"Wrote {out_dir / 'results_fanout.csv'} ({len(results_fanout)} rows)")
+        all_results.extend(results_fanout)
+        if not args.no_plot and results_fanout:
+            plot_focused_results(results_fanout, out_dir, "fanout")
+
+    if all_results:
+        write_csv(all_results, out_dir / "results.csv")
+        print(f"Wrote {out_dir / 'results.csv'} (combined {len(all_results)} rows)")
+    if not HAS_MATPLOTLIB and not args.no_plot:
         print("Install matplotlib for plots: pip install matplotlib", file=sys.stderr)
 
 

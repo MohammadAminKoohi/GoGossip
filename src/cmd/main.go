@@ -39,6 +39,9 @@ func main() {
 	flag.Int64Var(&cfg.Seed, "seed", 1234567890, "Seed value for this Node")
 	flag.StringVar(&cfg.ExperimentLogPath, "experiment-log", "", "Path to append experiment metric lines (JSON)")
 	flag.StringVar(&cfg.NeighborsPolicy, "neighbors-policy", "first", "Fanout selection: 'first' or 'random'")
+	flag.IntVar(&cfg.PullInterval, "pull-interval", 0, "IHAVE send interval in ms (0=disabled)")
+	flag.IntVar(&cfg.IHaveMaxIds, "ihave-max-ids", 32, "Max message IDs per IHAVE message")
+	flag.IntVar(&cfg.GossipCacheMaxSize, "gossip-cache-max", 0, "Max cached gossip payloads for IWANT (0=default 2000)")
 
 	flag.Parse()
 

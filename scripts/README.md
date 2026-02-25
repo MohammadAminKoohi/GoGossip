@@ -1,44 +1,51 @@
 # Gossip experiment script
 
-Run automated experiments for the gossip protocol: measure **95% convergence time** and **message overhead** for different N, TTL, fanout, and neighbors policy.
+Four parts:
 
-## Metrics
+1. **N×seed** – Effect of N and seeds. Normal config. **Two versions:** push-only and push-pull hybrid.  
+   Runs: N × seeds × 2 (e.g. 3×5×2 = 30).
 
-- **Convergence time**: From message creation (t0) until the time when 95% of nodes have received that message.
-- **Message overhead**: Total number of messages sent (gossip + HELLO, GET_PEERS, PEERS_LIST, PING, PONG) from t0 until 95% coverage.
+2. **TTL** – Only change TTL; fix fanout=3, policy=first. **Push-only.**  
+   Runs: N × seeds × 3 ttls (e.g. 45).
 
-## Prerequisites
+3. **Policy** – Only change policy; fix ttl=10, fanout=3. **Push-only.**  
+   Runs: N × seeds × 2 policies (e.g. 30).
 
-- Go (to build the node binary)
-- Python 3.9+
-- For plots: `pip install -r scripts/requirements.txt` (matplotlib, numpy)
+4. **Fanout** – Only change fanout; fix ttl=10, policy=first. **Push-only.**  
+   Runs: N × seeds × 3 fanouts (e.g. 45).
+
+**Normal config:** `ttl=10`, `fanout=3`, `policy=first`.
 
 ## Usage
 
 From the **project root** (GoGossip/):
 
 ```bash
-# Default: N=10,20,50 × 5 seeds × TTL=5,10,20 × fanout=2,3,5 × policy=first,random
+# Run all four parts
 python3 scripts/run_experiments.py
 
-# Custom node counts and fewer runs (faster)
-python3 scripts/run_experiments.py --N 10 20 --seeds 2 --ttl 10 --fanout 3 --policy first
+# Run only one part
+python3 scripts/run_experiments.py --test n_seed
+python3 scripts/run_experiments.py --test ttl
+python3 scripts/run_experiments.py --test policy
+python3 scripts/run_experiments.py --test fanout
 
-# Output to a specific directory
+# Fewer N and seeds (faster)
+python3 scripts/run_experiments.py --N 10 20 --seeds 2
+
+# Custom output directory
 python3 scripts/run_experiments.py --out-dir ./my_results
 
-# Skip plotting (only CSV)
+# Skip plots
 python3 scripts/run_experiments.py --no-plot
 ```
 
 ## Output
 
-- `experiment_results/results.csv`: columns N, run, ttl, fanout, policy, convergence_ms, overhead
-- `experiment_results/convergence_vs_N.png`: N on x-axis, convergence time (ms) on y-axis, one curve per (ttl, fanout, policy)
-- `experiment_results/overhead_vs_N.png`: N on x-axis, message count on y-axis
-- `experiment_results/ttl_effect.png`: two panels (convergence and overhead vs N) for different TTL values
-
-## Node flags used by the script
-
-- `-experiment-log <path>`: append JSON metric lines (gossip_recv, gossip_publish, msg_sent)
-- `-neighbors-policy first|random`: how to choose peers when forwarding (first in list vs random)
+- **results_n_seed.csv** – Part 1: N×seed, push_only and hybrid (columns: test, N, run, vary, pull_interval_ms, convergence_ms, overhead).
+- **results_ttl.csv** – Part 2: TTL only, push only.
+- **results_policy.csv** – Part 3: Policy only, push only.
+- **results_fanout.csv** – Part 4: Fanout only, push only.
+- **results.csv** – Combined (when `--test all`).
+- **plot_n_seed.png** – Part 1: convergence and overhead vs N, two curves (push only vs hybrid, mean over seeds).
+- **plot_ttl.png**, **plot_policy.png**, **plot_fanout.png** – Parts 2–4: one curve per varied value (push only).
