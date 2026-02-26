@@ -103,8 +103,6 @@ func New(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// Start begins listening for packets, starts background loops, and joins the network via bootstrap.
-// The provided ctx controls the lifetime of all background goroutines; cancel it (or call Stop) to shut down.
 func (n *Node) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	n.cancel = cancel

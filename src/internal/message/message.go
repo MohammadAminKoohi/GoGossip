@@ -77,13 +77,11 @@ type PongPayload struct {
 	Seq    int64  `json:"seq"`
 }
 
-// IHavePayload is sent periodically to tell neighbors which message IDs we have.
 type IHavePayload struct {
 	IDs    []string `json:"ids"`
 	MaxIDs int      `json:"max_ids"`
 }
 
-// IWantPayload requests full GOSSIP messages for the given IDs.
 type IWantPayload struct {
 	IDs []string `json:"ids"`
 }

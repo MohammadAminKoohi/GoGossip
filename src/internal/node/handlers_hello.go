@@ -76,7 +76,6 @@ func (n *Node) handleHello(fromAddr string, env message.Envelope) {
 		n.peers.Add(env.SenderID, peerAddr)
 	}
 
-	// Reply with HELLO only once per sender to avoid an infinite loop.
 	if n.helloReplied.Have(env.SenderID) {
 		slog.Debug("hello already replied to sender, skipping", slog.String("sender_id", env.SenderID))
 		return

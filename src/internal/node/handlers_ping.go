@@ -9,8 +9,8 @@ import (
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/message"
 )
 
-// runPingAndPruneLoop ticks at PingInterval: prunes peers that have not responded with PONG,
-// then sends a PING to every remaining peer. It exits when ctx is cancelled.
+const seenMaxSize = 10_000
+
 func (n *Node) runPingAndPruneLoop(ctx context.Context) {
 	interval := time.Duration(n.cfg.PingInterval) * time.Millisecond
 	if interval <= 0 {
@@ -27,6 +27,8 @@ func (n *Node) runPingAndPruneLoop(ctx context.Context) {
 			for _, p := range removed {
 				slog.Info("peer removed, no pong received", slog.String("node_id", p.NodeID), slog.String("addr", p.Addr))
 			}
+			n.seen.Prune(seenMaxSize)
+			n.helloReplied.Prune(seenMaxSize)
 			pingID := uuid.New().String()
 			for i, p := range n.peers.List() {
 				if p.NodeID == n.uuid.String() {

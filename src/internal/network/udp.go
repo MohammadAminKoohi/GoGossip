@@ -7,10 +7,8 @@ import (
 	"net"
 )
 
-// Handler is called for each received UDP packet (from address, payload).
 type Handler func(from *net.UDPAddr, data []byte)
 
-// Send sends data to the given UDP address (e.g. "127.0.0.1:8000").
 func Send(addr string, data []byte) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -25,7 +23,6 @@ func Send(addr string, data []byte) error {
 	return err
 }
 
-// Listen binds to addr and dispatches incoming UDP packets to handler until ctx is cancelled.
 func Listen(ctx context.Context, addr string, handler Handler) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -37,7 +34,6 @@ func Listen(ctx context.Context, addr string, handler Handler) error {
 	}
 	defer conn.Close()
 
-	// Closing the conn unblocks ReadFromUDP when the context is cancelled.
 	go func() {
 		<-ctx.Done()
 		conn.Close()

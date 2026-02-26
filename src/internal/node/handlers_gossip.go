@@ -83,9 +83,7 @@ func (n *Node) forwardGossip(excludeAddr string, payload message.GossipPayload, 
 		n.shufflePeers(peers)
 	}
 	fanout := n.cfg.Fanout
-	if fanout <= 0 {
-		fanout = 1
-	}
+
 	sent := 0
 	for _, p := range peers {
 		if sent >= fanout {

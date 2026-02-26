@@ -8,8 +8,6 @@ import (
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/message"
 )
 
-// runPullLoop periodically advertises known message IDs to a fanout of neighbors (IHAVE),
-// enabling them to request any they are missing (IWANT → GOSSIP). It exits when ctx is cancelled.
 func (n *Node) runPullLoop(ctx context.Context) {
 	interval := time.Duration(n.cfg.PullInterval) * time.Millisecond
 	if interval <= 0 {
@@ -126,7 +124,6 @@ func (n *Node) handleIWant(fromAddr string, env message.Envelope) {
 		if !ok {
 			continue
 		}
-		// TTL=0 so the receiver processes and caches it but does not re-forward.
 		if err := n.sendGossipTo(replyTo, gossipPayload, 0); err != nil {
 			slog.Debug("failed to send GOSSIP for IWANT", slog.String("id", id), slog.String("to", replyTo), slog.String("error", err.Error()))
 		}

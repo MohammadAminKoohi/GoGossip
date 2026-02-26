@@ -53,7 +53,6 @@ func (c *GossipCache) Get(id string) (message.GossipPayload, bool) {
 	return p, ok
 }
 
-// ListIDs returns up to max IDs ordered from most recent to oldest.
 func (c *GossipCache) ListIDs(max int) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
