@@ -129,3 +129,15 @@ func (n *Node) handleIWant(fromAddr string, env message.Envelope) {
 		}
 	}
 }
+
+./gogossip \
+  -port 8001 \
+  -bootstrap 127.0.0.1:8000 \
+  -fanout 3 \
+  -ttl 10 \
+  -ping-interval 1000 \
+  -peer-timeout 5000 \
+  -neighbors-policy random \
+  -pull-interval 1000 \
+  -pow-k 5 \
+  -debug
