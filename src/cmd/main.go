@@ -42,6 +42,7 @@ func main() {
 	flag.IntVar(&cfg.PullInterval, "pull-interval", 0, "IHAVE send interval in ms (0=disabled)")
 	flag.IntVar(&cfg.IHaveMaxIds, "ihave-max-ids", 32, "Max message IDs per IHAVE message")
 	flag.IntVar(&cfg.GossipCacheMaxSize, "gossip-cache-max", 0, "Max cached gossip payloads for IWANT (0=default 2000)")
+	flag.IntVar(&cfg.PowK, "pow-k", 4, "PoW difficulty: leading hex-zero nibbles required in HELLO (0=disabled)")
 
 	flag.Parse()
 

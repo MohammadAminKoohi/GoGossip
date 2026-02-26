@@ -40,8 +40,16 @@ type PeerInfo struct {
 	Addr   string `json:"addr"`
 }
 
+type PoWProof struct {
+	HashAlg     string `json:"hash_alg"`
+	DifficultyK int    `json:"difficulty_k"`
+	Nonce       uint64 `json:"nonce"`
+	DigestHex   string `json:"digest_hex"`
+}
+
 type HelloPayload struct {
-	Capabilities []string `json:"capabilities"`
+	Capabilities []string  `json:"capabilities"`
+	PoW          *PoWProof `json:"pow,omitempty"`
 }
 
 type GetPeersPayload struct {

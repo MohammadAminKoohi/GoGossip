@@ -15,6 +15,7 @@ import (
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/message"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/network"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/peer"
+	"github.com/mohammadaminkoohi/GoGossip/src/internal/pow"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/seen"
 )
 
@@ -34,6 +35,7 @@ type Config struct {
 	PullInterval       int    // ms; if > 0, send IHAVE to neighbors at this interval
 	IHaveMaxIds        int    // max message IDs to put in one IHAVE message
 	GossipCacheMaxSize int    // max gossip payloads to cache for IWANT responses (0 = default)
+	PowK               int    // number of leading hex-zero nibbles required for HELLO PoW (0 = disabled)
 }
 
 // gossipCache stores recent gossip payloads by id (origin_id:origin_ts) for IWANT responses.
@@ -108,6 +110,8 @@ type Node struct {
 	helloReplied *seen.Set
 	gossipCache  *gossipCache
 
+	powProof *message.PoWProof // pre-mined PoW for HELLO (nil if PowK == 0)
+
 	expLog   *os.File
 	expLogMu sync.Mutex
 }
@@ -140,6 +144,18 @@ func New(cfg Config) (*Node, error) {
 	}
 	if cfg.NeighborsPolicy == "random" && cfg.Seed != 0 {
 		rand.Seed(cfg.Seed)
+	}
+
+	if cfg.PowK > 0 {
+		slog.Info("mining PoW for HELLO", slog.Int("difficulty_k", cfg.PowK))
+		nonce, digest := pow.Mine(n.uuid.String(), cfg.PowK)
+		n.powProof = &message.PoWProof{
+			HashAlg:     pow.HashAlg,
+			DifficultyK: cfg.PowK,
+			Nonce:       nonce,
+			DigestHex:   digest,
+		}
+		slog.Info("PoW mined", slog.Uint64("nonce", nonce), slog.String("digest", digest))
 	}
 
 	slog.Info("node created", slog.String("uuid", n.uuid.String()), slog.String("addr", n.selfAddr))
@@ -290,7 +306,7 @@ func (n *Node) sendHelloTo(addr string) error {
 		n.uuid.String(),
 		n.selfAddr,
 		n.cfg.TTL,
-		message.HelloPayload{Capabilities: []string{"udp", "json"}},
+		message.HelloPayload{Capabilities: []string{"udp", "json"}, PoW: n.powProof},
 	)
 	if err != nil {
 		return fmt.Errorf("create hello: %w", err)
@@ -341,7 +357,8 @@ func (n *Node) handlePacket(from *net.UDPAddr, data []byte) {
 	fromAddr := ""
 	if from != nil {
 		fromAddr = from.String()
-		if env.SenderID != "" && env.SenderID != n.uuid.String() {
+		// HELLO messages do their own peer-add after PoW validation; skip auto-add for them.
+		if env.MsgType != message.MessageTypeHello && env.SenderID != "" && env.SenderID != n.uuid.String() {
 			// Use SenderAddr (where the peer is listening) so we can reach them for gossip/ping.
 			// fromAddr is the ephemeral UDP source port and is not where they listen.
 			peerAddr := fromAddr
@@ -378,6 +395,42 @@ func (n *Node) handleHello(fromAddr string, env message.Envelope) {
 	if env.SenderID == "" || env.SenderID == n.uuid.String() {
 		return
 	}
+
+	// Validate PoW when enforcement is enabled.
+	if n.cfg.PowK > 0 {
+		payload, err := message.DecodePayload[message.HelloPayload](env)
+		if err != nil || payload.PoW == nil {
+			slog.Warn("hello rejected: missing PoW", slog.String("sender_id", env.SenderID))
+			return
+		}
+		p := payload.PoW
+		if p.DifficultyK != n.cfg.PowK {
+			slog.Warn("hello rejected: wrong difficulty",
+				slog.String("sender_id", env.SenderID),
+				slog.Int("got", p.DifficultyK),
+				slog.Int("want", n.cfg.PowK),
+			)
+			return
+		}
+		if !pow.Verify(env.SenderID, p.Nonce, p.DigestHex, n.cfg.PowK) {
+			slog.Warn("hello rejected: invalid PoW",
+				slog.String("sender_id", env.SenderID),
+				slog.Uint64("nonce", p.Nonce),
+			)
+			return
+		}
+		slog.Debug("hello PoW valid", slog.String("sender_id", env.SenderID), slog.Uint64("nonce", p.Nonce))
+	}
+
+	// Add sender to peer list only after PoW passes.
+	peerAddr := fromAddr
+	if env.SenderAddr != "" {
+		peerAddr = env.SenderAddr
+	}
+	if peerAddr != "" {
+		n.peers.Add(env.SenderID, peerAddr)
+	}
+
 	// Reply with HELLO only once per sender to avoid infinite HELLO loop.
 	if n.helloReplied.Have(env.SenderID) {
 		slog.Debug("hello already replied to sender, skipping", slog.String("sender_id", env.SenderID))
