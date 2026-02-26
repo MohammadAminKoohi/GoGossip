@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -45,11 +46,13 @@ type Node struct {
 	helloReplied *seen.Set
 	gossipCache  *cache.GossipCache
 
-	rng      *rand.Rand       
-	powProof *message.PoWProof 
+	rng      *rand.Rand
+	powProof *message.PoWProof
 
 	expLog   *json.Encoder
 	expLogMu sync.Mutex
+
+	cancel context.CancelFunc
 }
 
 func New(cfg Config) (*Node, error) {
@@ -101,15 +104,19 @@ func New(cfg Config) (*Node, error) {
 }
 
 // Start begins listening for packets, starts background loops, and joins the network via bootstrap.
-func (n *Node) Start() error {
+// The provided ctx controls the lifetime of all background goroutines; cancel it (or call Stop) to shut down.
+func (n *Node) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	n.cancel = cancel
+
 	go func() {
-		if err := network.Listen(n.selfAddr, n.handlePacket); err != nil {
+		if err := network.Listen(ctx, n.selfAddr, n.handlePacket); err != nil {
 			slog.Error("listener exited", slog.String("error", err.Error()))
 		}
 	}()
-	go n.runPingAndPruneLoop()
+	go n.runPingAndPruneLoop(ctx)
 	if n.cfg.PullInterval > 0 {
-		go n.runPullLoop()
+		go n.runPullLoop(ctx)
 	}
 	if n.cfg.Bootstrap != "" {
 		if err := n.sendHelloToBootstrap(); err != nil {
@@ -120,4 +127,11 @@ func (n *Node) Start() error {
 		}
 	}
 	return nil
+}
+
+// Stop cancels the context that drives all background goroutines, shutting the node down cleanly.
+func (n *Node) Stop() {
+	if n.cancel != nil {
+		n.cancel()
+	}
 }

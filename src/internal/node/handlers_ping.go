@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -9,36 +10,41 @@ import (
 )
 
 // runPingAndPruneLoop ticks at PingInterval: prunes peers that have not responded with PONG,
-// then sends a PING to every remaining peer.
-func (n *Node) runPingAndPruneLoop() {
+// then sends a PING to every remaining peer. It exits when ctx is cancelled.
+func (n *Node) runPingAndPruneLoop(ctx context.Context) {
 	interval := time.Duration(n.cfg.PingInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		removed := n.peers.PruneStale()
-		for _, p := range removed {
-			slog.Info("peer removed, no pong received", slog.String("node_id", p.NodeID), slog.String("addr", p.Addr))
-		}
-		pingID := uuid.New().String()
-		for i, p := range n.peers.List() {
-			if p.NodeID == n.uuid.String() {
-				continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			removed := n.peers.PruneStale()
+			for _, p := range removed {
+				slog.Info("peer removed, no pong received", slog.String("node_id", p.NodeID), slog.String("addr", p.Addr))
 			}
-			env, err := message.NewEnvelope(message.MessageTypePing, n.uuid.String(), n.selfAddr, n.cfg.TTL, message.PingPayload{PingID: pingID, Seq: int64(i)})
-			if err != nil {
-				slog.Warn("failed to create ping envelope", slog.String("to", p.Addr), slog.String("error", err.Error()))
-				continue
-			}
-			data, err := env.Encode()
-			if err != nil {
-				slog.Warn("failed to encode ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
-				continue
-			}
-			if err := n.sendWithLog(p.Addr, data, message.MessageTypePing); err != nil {
-				slog.Debug("failed to send ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
+			pingID := uuid.New().String()
+			for i, p := range n.peers.List() {
+				if p.NodeID == n.uuid.String() {
+					continue
+				}
+				env, err := message.NewEnvelope(message.MessageTypePing, n.uuid.String(), n.selfAddr, n.cfg.TTL, message.PingPayload{PingID: pingID, Seq: int64(i)})
+				if err != nil {
+					slog.Warn("failed to create ping envelope", slog.String("to", p.Addr), slog.String("error", err.Error()))
+					continue
+				}
+				data, err := env.Encode()
+				if err != nil {
+					slog.Warn("failed to encode ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
+					continue
+				}
+				if err := n.sendWithLog(p.Addr, data, message.MessageTypePing); err != nil {
+					slog.Debug("failed to send ping", slog.String("to", p.Addr), slog.String("error", err.Error()))
+				}
 			}
 		}
 	}

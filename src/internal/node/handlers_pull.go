@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -8,8 +9,8 @@ import (
 )
 
 // runPullLoop periodically advertises known message IDs to a fanout of neighbors (IHAVE),
-// enabling them to request any they are missing (IWANT → GOSSIP).
-func (n *Node) runPullLoop() {
+// enabling them to request any they are missing (IWANT → GOSSIP). It exits when ctx is cancelled.
+func (n *Node) runPullLoop(ctx context.Context) {
 	interval := time.Duration(n.cfg.PullInterval) * time.Millisecond
 	if interval <= 0 {
 		return
@@ -20,42 +21,47 @@ func (n *Node) runPullLoop() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		ids := n.gossipCache.ListIDs(maxIds)
-		if len(ids) == 0 {
-			continue
-		}
-		peers := n.peers.List()
-		if n.cfg.NeighborsPolicy == "random" && len(peers) > 1 {
-			n.shufflePeers(peers)
-		}
-		fanout := n.cfg.Fanout
-		if fanout <= 0 {
-			fanout = 1
-		}
-		sent := 0
-		for _, p := range peers {
-			if sent >= fanout {
-				break
-			}
-			if p.NodeID == n.uuid.String() {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ids := n.gossipCache.ListIDs(maxIds)
+			if len(ids) == 0 {
 				continue
 			}
-			env, err := message.NewEnvelope(message.MessageTypeIHave, n.uuid.String(), n.selfAddr, n.cfg.TTL, message.IHavePayload{IDs: ids, MaxIDs: maxIds})
-			if err != nil {
-				continue
+			peers := n.peers.List()
+			if n.cfg.NeighborsPolicy == "random" && len(peers) > 1 {
+				n.shufflePeers(peers)
 			}
-			data, err := env.Encode()
-			if err != nil {
-				continue
+			fanout := n.cfg.Fanout
+			if fanout <= 0 {
+				fanout = 1
 			}
-			if err := n.sendWithLog(p.Addr, data, message.MessageTypeIHave); err != nil {
-				continue
+			sent := 0
+			for _, p := range peers {
+				if sent >= fanout {
+					break
+				}
+				if p.NodeID == n.uuid.String() {
+					continue
+				}
+				env, err := message.NewEnvelope(message.MessageTypeIHave, n.uuid.String(), n.selfAddr, n.cfg.TTL, message.IHavePayload{IDs: ids, MaxIDs: maxIds})
+				if err != nil {
+					continue
+				}
+				data, err := env.Encode()
+				if err != nil {
+					continue
+				}
+				if err := n.sendWithLog(p.Addr, data, message.MessageTypeIHave); err != nil {
+					continue
+				}
+				sent++
 			}
-			sent++
-		}
-		if sent > 0 {
-			slog.Info("IHAVE sent", slog.Int("peers", sent), slog.Int("ids", len(ids)))
+			if sent > 0 {
+				slog.Info("IHAVE sent", slog.Int("peers", sent), slog.Int("ids", len(ids)))
+			}
 		}
 	}
 }

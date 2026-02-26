@@ -2,33 +2,67 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/node"
 )
 
-func setupLogger(level slog.Level) *slog.Logger {
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: level,
-	})
-
-	logger := slog.New(handler)
-
-	slog.SetDefault(logger)
-
-	return logger
+func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 }
 
-func main() {
-	cfg := node.Config{}
+func run() error {
+	cfg, debug := parseFlags()
 
+	logger := setupLogger(logLevel(debug))
+	slog.SetDefault(logger)
+
+	logger.Info("configuration loaded", slog.Any("config", cfg))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	n, err := node.New(cfg)
+	if err != nil {
+		return fmt.Errorf("init node: %w", err)
+	}
+	defer n.Stop()
+
+	if cfg.Bootstrap != "" {
+		logger.Info("starting as peer", slog.String("bootstrap", cfg.Bootstrap), slog.Int("port", cfg.Port))
+	} else {
+		logger.Info("starting as seed node", slog.Int("port", cfg.Port))
+	}
+
+	if err := n.Start(ctx); err != nil {
+		return fmt.Errorf("start node: %w", err)
+	}
+
+	logger.Info("node running, type a message and press Enter to gossip it (Ctrl+C to exit)")
+
+	if err := runCLI(ctx, n, logger); err != nil {
+		return err
+	}
+
+	logger.Info("shutting down")
+	return nil
+}
+
+func parseFlags() (node.Config, bool) {
+	var cfg node.Config
 	var debug bool
-	flag.BoolVar(&debug, "debug", false, "Enable debug logs (ping/pong detail, etc.)")
 
+	flag.BoolVar(&debug, "debug", false, "Enable debug logs (ping/pong detail, etc.)")
 	flag.IntVar(&cfg.Port, "port", 8000, "Listening port for this Node")
 	flag.StringVar(&cfg.Bootstrap, "bootstrap", "", "Address of the seed Node")
 	flag.IntVar(&cfg.Fanout, "fanout", 3, "Fanout value for this Node")
@@ -43,38 +77,29 @@ func main() {
 	flag.IntVar(&cfg.IHaveMaxIds, "ihave-max-ids", 32, "Max message IDs per IHAVE message")
 	flag.IntVar(&cfg.GossipCacheMaxSize, "gossip-cache-max", 0, "Max cached gossip payloads for IWANT (0=default 2000)")
 	flag.IntVar(&cfg.PowK, "pow-k", 4, "PoW difficulty: leading hex-zero nibbles required in HELLO (0=disabled)")
-
 	flag.Parse()
 
-	level := slog.LevelInfo
+	return cfg, debug
+}
+
+func logLevel(debug bool) slog.Level {
 	if debug {
-		level = slog.LevelDebug
+		return slog.LevelDebug
 	}
-	logger := setupLogger(level)
+	return slog.LevelInfo
+}
 
-	logger.Info("configuration loaded", slog.Any("config", cfg))
+func setupLogger(level slog.Level) *slog.Logger {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+	return slog.New(handler)
+}
 
-	n, err := node.New(cfg)
-	if err != nil {
-		logger.Error("failed to initialize node", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	if cfg.Bootstrap != "" {
-		logger.Info("starting as peer", slog.String("bootstrap", cfg.Bootstrap), slog.Int("port", cfg.Port))
-	} else {
-		logger.Info("starting as seed node", slog.Int("port", cfg.Port))
-	}
-
-	if err := n.Start(); err != nil {
-		logger.Error("node failed to start", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
-	// CLI: each line of input is published as a gossip message
-	fmt.Println("Node running. Type a message and press Enter to gossip it (Ctrl+C to exit).")
+func runCLI(ctx context.Context, n *node.Node, logger *slog.Logger) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			break
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -82,7 +107,7 @@ func main() {
 		n.PublishGossip("chat", line)
 	}
 	if err := scanner.Err(); err != nil {
-		logger.Error("reading stdin", slog.String("error", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("reading stdin: %w", err)
 	}
+	return nil
 }

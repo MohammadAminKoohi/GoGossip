@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -24,7 +25,8 @@ func Send(addr string, data []byte) error {
 	return err
 }
 
-func Listen(addr string, handler Handler) error {
+// Listen binds to addr and dispatches incoming UDP packets to handler until ctx is cancelled.
+func Listen(ctx context.Context, addr string, handler Handler) error {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return fmt.Errorf("resolve udp address: %w", err)
@@ -35,10 +37,19 @@ func Listen(addr string, handler Handler) error {
 	}
 	defer conn.Close()
 
+	// Closing the conn unblocks ReadFromUDP when the context is cancelled.
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	buf := make([]byte, 65535)
 	for {
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			slog.Error("udp read failed", slog.String("error", err.Error()))
 			continue
 		}
