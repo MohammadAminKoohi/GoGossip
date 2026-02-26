@@ -12,14 +12,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/mohammadaminkoohi/GoGossip/src/internal/cache"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/message"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/network"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/peer"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/pow"
 	"github.com/mohammadaminkoohi/GoGossip/src/internal/seen"
 )
-
-const defaultGossipCacheMax = 2000
 
 type Config struct {
 	Port               int
@@ -38,67 +37,6 @@ type Config struct {
 	PowK               int    // number of leading hex-zero nibbles required for HELLO PoW (0 = disabled)
 }
 
-// gossipCache stores recent gossip payloads by id (origin_id:origin_ts) for IWANT responses.
-type gossipCache struct {
-	mu    sync.RWMutex
-	items map[string]message.GossipPayload
-	order []string
-	max   int
-}
-
-func newGossipCache(maxSize int) *gossipCache {
-	if maxSize <= 0 {
-		maxSize = defaultGossipCacheMax
-	}
-	return &gossipCache{items: make(map[string]message.GossipPayload), max: maxSize}
-}
-
-func (c *gossipCache) Add(id string, payload message.GossipPayload) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.items[id]; ok {
-		// move to end of order (most recent)
-		for i, x := range c.order {
-			if x == id {
-				c.order = append(append(c.order[:i], c.order[i+1:]...), id)
-				break
-			}
-		}
-		return
-	}
-	if len(c.order) >= c.max {
-		old := c.order[0]
-		c.order = c.order[1:]
-		delete(c.items, old)
-	}
-	c.items[id] = payload
-	c.order = append(c.order, id)
-}
-
-func (c *gossipCache) Get(id string) (message.GossipPayload, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	p, ok := c.items[id]
-	return p, ok
-}
-
-// ListIDs returns up to max IDs (most recent first by insertion order).
-func (c *gossipCache) ListIDs(max int) []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if max <= 0 || len(c.order) == 0 {
-		return nil
-	}
-	start := len(c.order) - max
-	if start < 0 {
-		start = 0
-	}
-	ids := make([]string, 0, max)
-	for i := len(c.order) - 1; i >= start && len(ids) < max; i-- {
-		ids = append(ids, c.order[i])
-	}
-	return ids
-}
 
 type Node struct {
 	cfg      Config
@@ -108,7 +46,7 @@ type Node struct {
 	peers        *peer.Store
 	seen         *seen.Set
 	helloReplied *seen.Set
-	gossipCache  *gossipCache
+	gossipCache  *cache.GossipCache
 
 	powProof *message.PoWProof // pre-mined PoW for HELLO (nil if PowK == 0)
 
@@ -122,10 +60,6 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
 	}
 
-	cacheMax := cfg.GossipCacheMaxSize
-	if cacheMax <= 0 {
-		cacheMax = defaultGossipCacheMax
-	}
 	n := &Node{
 		cfg:          cfg,
 		selfAddr:     fmt.Sprintf("127.0.0.1:%d", cfg.Port),
@@ -133,7 +67,7 @@ func New(cfg Config) (*Node, error) {
 		peers:        peer.NewStore(cfg.PeerLimit, cfg.PeerTimeout),
 		seen:         seen.NewSet(),
 		helloReplied: seen.NewSet(),
-		gossipCache:  newGossipCache(cacheMax),
+		gossipCache:  cache.New(cfg.GossipCacheMaxSize),
 	}
 	if cfg.ExperimentLogPath != "" {
 		f, err := os.OpenFile(cfg.ExperimentLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
